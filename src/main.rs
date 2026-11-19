@@ -11,15 +11,14 @@ fn main() -> std::io::Result<()> {
     let mut file = File::create("test.rml")?;
     file.write_all(render(&[
         Init, 
-        ZHeights{cut: Steps(0),travel: Steps(1000)},
+        ZHeights{cut: Steps::from_mm(0.0),travel: Steps::from_mm(10.0)},
         SpeedXy(10.0),
         SpeedZ(1.0),
-        Spindle(true),
-        CutTo(Steps(1000), Steps(0)),
-        CutTo(Steps(1000), Steps(1000)),
-        CutTo(Steps(0), Steps(1000)),
-        CutTo(Steps(0), Steps(0)),
-        Spindle(false),
+        CutTo(Steps::from_mm(10.0), Steps::from_mm(0.0)),
+        CutTo(Steps::from_mm(10.0), Steps::from_mm(10.0)),
+        CutTo(Steps::from_mm(0.0), Steps::from_mm(10.0)),
+        CutTo(Steps::from_mm(0.0), Steps::from_mm(0.0)),
+        Home
         ]).as_bytes())?;
     Ok(())
 }
