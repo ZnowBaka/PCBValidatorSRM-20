@@ -5,8 +5,6 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-egui = "0.37.0"
 gerber-types = "0.7.0"
 gerber_parser = "0.5.0"
-gerber_viewer = "0.8.0"
 zip = "9.7.3"
