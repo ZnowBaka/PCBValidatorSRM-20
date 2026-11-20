@@ -1,5 +1,3 @@
-use std::fmt::write;
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Steps(pub i32); // 1 step = 0.01 mm
 
@@ -37,7 +35,7 @@ pub fn render(cmds: &[Cmd]) -> String {
             Cmd::CutTo(x, y) => write!(out, "PD{},{};", x.0, y.0),
             Cmd::Dwell(millis) => write!(out, "!DW{millis};"),
             Cmd::Stop => write!(out, "!NR;"),
-            Cmd::SpindleRPM(RPM) => write!(out, "!RC{RPM}"),
+            Cmd::SpindleRPM(rpm) => write!(out, "!RC{rpm}"),
             Cmd::Home => write!(out, "H;")
         }
         .unwrap();

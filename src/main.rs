@@ -16,6 +16,7 @@ fn main() -> std::io::Result<()> {
         SpeedZ(1.0),
         CutTo(Steps::from_mm(10.0), Steps::from_mm(0.0)),
         CutTo(Steps::from_mm(10.0), Steps::from_mm(10.0)),
+        Dwell(1000),
         CutTo(Steps::from_mm(0.0), Steps::from_mm(10.0)),
         CutTo(Steps::from_mm(0.0), Steps::from_mm(0.0)),
         Home
