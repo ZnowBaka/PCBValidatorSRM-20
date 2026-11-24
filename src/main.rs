@@ -1,4 +1,7 @@
-use eframe::egui::{self, Align, Color32, Layout, Pos2, Sense, Stroke, Vec2};
+mod gerber;
+
+use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, Sense, Stroke, Vec2};
+use std::path::Path;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -61,6 +64,8 @@ struct PcbApp {
     view_mode: ViewMode,
     viewport: Viewport2D,
     log: Vec<String>,
+    layer: Option<gerber::GerberLayer>,
+    fit_requested: bool,
 }
 
 impl Default for PcbApp {
@@ -72,7 +77,9 @@ impl Default for PcbApp {
             selected_bit: 0,
             view_mode: ViewMode::Gerber,
             viewport: Viewport2D { offset: Vec2::ZERO, zoom: 4.0 },
-            log: vec!["Ready.".into()],
+            log: vec!["Ready. Drop a Gerber file on the window.".into()],
+            layer: None,
+            fit_requested: false,
         }
     }
 }
@@ -81,6 +88,8 @@ impl Default for PcbApp {
 
 impl eframe::App for PcbApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.handle_dropped_files(ui);
+
         // Order matters: outermost panels first, CentralPanel last.
         self.top_bar(ui);
         self.bottom_bar(ui);
@@ -105,11 +114,17 @@ impl PcbApp {
                 let spacing = ui.spacing().item_spacing.x;
                 let h = 28.0;
 
-                ui.add_sized(
+                let resp = ui.add_sized(
                     [ui.available_width() - button_w - spacing, h],
                     egui::TextEdit::singleline(&mut self.path_text)
-                        .hint_text("Gerber file / project path…"),
+                        .hint_text("Gerber file path + Enter (or drop a file on the window)…"),
                 );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let path = self.path_text.trim().trim_matches('"').to_owned();
+                    if !path.is_empty() {
+                        self.load_file(Path::new(&path));
+                    }
+                }
 
                 let (fill, label) = if self.expert_mode {
                     (Color32::from_rgb(237, 28, 36), "Expert mode: ON")
@@ -230,24 +245,32 @@ impl PcbApp {
             });
     }
 
-    /// Centre: pannable / zoomable canvas
+    /// Centre: pannable / zoomable canvas showing the loaded Gerber layer
     fn canvas(&mut self, root: &mut egui::Ui) {
         egui::CentralPanel::default().show(root, |ui| {
             let (response, painter) =
                 ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
             let rect = response.rect;
 
+            // fit to view: after loading, on double-click, or with F
+            let fit_key = response.hovered() && ui.input(|i| i.key_pressed(egui::Key::F));
+            if self.fit_requested || response.double_clicked() || fit_key {
+                self.fit_view(rect);
+                self.fit_requested = false;
+            }
+
             // pan
             if response.dragged() {
                 self.viewport.offset += response.drag_delta();
             }
-            // zoom (scroll), keeping the point under the cursor fixed
+            // zoom (scroll wheel / pinch), keeping the point under the cursor fixed
             if response.hovered() {
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll != 0.0 {
-                    let factor = (scroll * 0.002).exp();
+                let pinch = ui.input(|i| i.zoom_delta());
+                let factor = (scroll * 0.002).exp() * pinch;
+                if factor != 1.0 {
                     let old = self.viewport.zoom;
-                    let new = (old * factor).clamp(0.5, 200.0);
+                    let new = (old * factor).clamp(0.01, 5000.0);
                     if let Some(p) = response.hover_pos() {
                         let c = rect.center() + self.viewport.offset;
                         let world = (p - c) / old;
@@ -257,36 +280,132 @@ impl PcbApp {
                 }
             }
 
-            let vp = &self.viewport;
-            let to_screen = |p: Pos2| -> Pos2 { rect.center() + vp.offset + p.to_vec2() * vp.zoom };
+            let zoom = self.viewport.zoom;
+            let c = rect.center() + self.viewport.offset; // screen position of world origin
 
-            // TODO: replace with real parsed Gerber / generated toolpath data
-            let (board, traces) = demo_geometry();
+            // origin axes
+            let axis = Stroke::new(1.0, Color32::from_gray(90));
+            painter.line_segment([Pos2::new(rect.left(), c.y), Pos2::new(rect.right(), c.y)], axis);
+            painter.line_segment([Pos2::new(c.x, rect.top()), Pos2::new(c.x, rect.bottom())], axis);
 
-            match self.view_mode {
-                ViewMode::Gerber => {
-                    let pts: Vec<Pos2> = board.iter().map(|&p| to_screen(p)).collect();
-                    painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0, Color32::GRAY)));
-                    for t in &traces {
-                        let pts: Vec<Pos2> = t.iter().map(|&p| to_screen(p)).collect();
-                        painter.add(egui::Shape::line(
-                            pts,
-                            Stroke::new(0.3 * vp.zoom, Color32::from_rgb(200, 150, 50)),
-                        ));
+            match &self.layer {
+                Some(layer) => {
+                    let bg = ui.visuals().panel_fill;
+                    let fg = match self.view_mode {
+                        ViewMode::Gerber => Color32::from_rgb(200, 150, 50),
+                        ViewMode::Toolpath => Color32::from_gray(70),
+                    };
+                    // World mm (Y up) -> screen px (Y down). Clear-polarity vertices use the
+                    // background colour.
+                    let mut mesh = egui::Mesh::default();
+                    mesh.vertices.reserve(layer.verts.len());
+                    for v in &layer.verts {
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: Pos2::new(c.x + v.pos[0] * zoom, c.y - v.pos[1] * zoom),
+                            uv: egui::epaint::WHITE_UV,
+                            color: if v.clear { bg } else { fg },
+                        });
+                    }
+                    mesh.indices.extend_from_slice(&layer.indices);
+                    painter.add(egui::Shape::mesh(mesh));
+
+                    if self.view_mode == ViewMode::Toolpath {
+                        painter.text(
+                            rect.center_top() + Vec2::new(0.0, 12.0),
+                            Align2::CENTER_TOP,
+                            "Toolpath generation not implemented yet",
+                            FontId::proportional(14.0),
+                            ui.visuals().weak_text_color(),
+                        );
                     }
                 }
-                ViewMode::Toolpath => {
-                    let w = self.bits[self.selected_bit].diameter_mm * vp.zoom;
-                    for t in &traces {
-                        let pts: Vec<Pos2> = t.iter().map(|&p| to_screen(p)).collect();
-                        painter.add(egui::Shape::line(
-                            pts,
-                            Stroke::new(w.max(1.0), Color32::from_rgb(60, 140, 255)),
-                        ));
-                    }
+                None => {
+                    painter.text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        "Drop a Gerber file here\nor type its path above and press Enter",
+                        FontId::proportional(16.0),
+                        ui.visuals().weak_text_color(),
+                    );
                 }
             }
+
+            // cursor position in mm
+            if let Some(p) = response.hover_pos() {
+                let (wx, wy) = ((p.x - c.x) / zoom, -(p.y - c.y) / zoom);
+                painter.text(
+                    rect.left_bottom() + Vec2::new(8.0, -8.0),
+                    Align2::LEFT_BOTTOM,
+                    format!("x {wx:8.3} mm   y {wy:8.3} mm   zoom {zoom:.1} px/mm"),
+                    FontId::monospace(12.0),
+                    ui.visuals().text_color(),
+                );
+            }
         });
+    }
+
+    fn fit_view(&mut self, rect: Rect) {
+        let Some((min, max)) = self.layer.as_ref().and_then(|l| l.bounds) else {
+            return;
+        };
+        let w = (max[0] - min[0]).max(1e-3);
+        let h = (max[1] - min[1]).max(1e-3);
+        let zoom = (rect.width() / w).min(rect.height() / h) * 0.9;
+        let (cx, cy) = ((min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0);
+        self.viewport.zoom = zoom;
+        self.viewport.offset = Vec2::new(-cx * zoom, cy * zoom);
+    }
+
+fn handle_dropped_files(&mut self, ui: &egui::Ui) {
+    let dropped = ui.input(|i| i.raw.dropped_files.clone());
+    for f in dropped {
+        let path = f.path();
+        if path.is_file() {
+            self.path_text = path.display().to_string();
+            self.load_file(path);
+        } else {
+            match f.bytes() {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    self.load_gerber_text("dropped file", &text);
+                }
+                Err(e) => self.log.push(format!("Could not read dropped file: {e}")),
+            }
+        }
+    }
+}
+
+    fn load_file(&mut self, path: &Path) {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.load_gerber_text(&name, &String::from_utf8_lossy(&bytes));
+            }
+            Err(e) => self.log.push(format!("Cannot read {}: {e}", path.display())),
+        }
+    }
+
+    fn load_gerber_text(&mut self, name: &str, text: &str) {
+        let layer = gerber::parse(text);
+        match layer.bounds {
+            Some((min, max)) => self.log.push(format!(
+                "{name}: {:.2} x {:.2} mm, {} draws, {} flashes, {} regions",
+                max[0] - min[0],
+                max[1] - min[1],
+                layer.n_draws,
+                layer.n_flashes,
+                layer.n_regions
+            )),
+            None => self.log.push(format!("{name}: no geometry found (is this a Gerber file?)")),
+        }
+        for w in layer.warnings.iter().take(5) {
+            self.log.push(format!("warning: {w}"));
+        }
+        self.layer = Some(layer);
+        self.fit_requested = true;
     }
 
     fn generate(&mut self) {
@@ -298,20 +417,4 @@ impl PcbApp {
         // TODO: run toolpath generation (ideally on a background thread)
         self.view_mode = ViewMode::Toolpath;
     }
-}
-
-/// Placeholder shapes resembling the sketch (units: mm, origin centred).
-fn demo_geometry() -> (Vec<Pos2>, Vec<Vec<Pos2>>) {
-    let board = vec![
-        Pos2::new(-10.0, -12.0),
-        Pos2::new(20.0, -2.0),
-        Pos2::new(13.0, 18.0),
-        Pos2::new(-17.0, 8.0),
-    ];
-    let traces = vec![
-        vec![Pos2::new(-4.0, -9.0), Pos2::new(-9.0, -2.0), Pos2::new(2.0, 1.0), Pos2::new(0.0, 9.0)],
-        vec![Pos2::new(0.0, 9.0), Pos2::new(9.0, 0.0)],
-        vec![Pos2::new(-12.0, 7.0), Pos2::new(0.0, 9.0)],
-    ];
-    (board, traces)
 }
