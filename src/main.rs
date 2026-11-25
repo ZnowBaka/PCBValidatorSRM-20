@@ -1,7 +1,20 @@
-mod gerber;
-
-use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, Sense, Stroke, Vec2};
+use std::io::{BufReader, Cursor};
 use std::path::Path;
+
+use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, Pos2, Sense, Stroke, Vec2};
+use gerber_viewer::gerber_types::{Command, ExtendedCode, Unit};
+use gerber_viewer::{
+    BoundingBox, GerberLayer, GerberRenderer, GerberTransform, RenderConfiguration, UiState,
+    ViewState,
+};
+
+mod zip_reader;
+use crate::zip_reader::read_zip;
+
+/// Substrings used to pick Gerber files out of a zip (matched against the entry name).
+const ZIP_PATTERNS: &[&str] = &[
+    "copper_top", "profile", "soldermask",
+];
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -51,9 +64,65 @@ enum ViewMode {
     Toolpath,
 }
 
-struct Viewport2D {
-    offset: Vec2, // screen-space pan
-    zoom: f32,    // pixels per mm
+struct LoadedLayer {
+    name: String,
+    layer: GerberLayer,
+    /// Coordinates in the layer are in this unit (gerber_viewer does not convert).
+    unit: Unit,
+    visible: bool,
+    color: Color32,
+}
+
+/// Guess a colour and default visibility from the file name (KiCad / Protel naming).
+fn style_for(name: &str) -> (Color32, bool) {
+    let n = name.to_ascii_lowercase();
+    let has = |keys: &[&str]| keys.iter().any(|k| n.contains(k));
+    if has(&["edge_cuts", ".gm1", ".gko", ".gml", "outline", "profile"]) {
+        (Color32::from_rgb(230, 220, 90), true) // board outline
+    } else if has(&["silk", "mask", "paste", ".gto", ".gbo", ".gts", ".gbs"]) {
+        (Color32::from_gray(150), false) // not needed for milling
+    } else if has(&["b_cu", ".gbl", "bottom"]) {
+        (Color32::from_rgb(80, 140, 230), false) // bottom copper, hidden by default
+    } else {
+        (Color32::from_rgb(200, 150, 50), true) // top copper / unknown
+    }
+}
+
+/// Parse one Gerber file into a layer. Err(reason) if it has no drawable geometry.
+fn parse_layer(name: &str, bytes: Vec<u8>) -> Result<LoadedLayer, String> {
+    let mut parse_err = None;
+    let doc = match gerber_viewer::gerber_parser::parse(BufReader::new(Cursor::new(bytes))) {
+        Ok(doc) => doc,
+        Err((doc, err)) => {
+            // a partial document is still returned, so use whatever parsed
+            parse_err = Some(format!("{err:?}"));
+            doc
+        }
+    };
+    let commands = doc.into_commands();
+
+    // gerber_viewer draws in file units, so remember which unit that is
+    let unit = commands
+        .iter()
+        .find_map(|c| match c {
+            Command::ExtendedCode(ExtendedCode::Unit(u)) => Some(*u),
+            _ => None,
+        })
+        .unwrap_or(Unit::Millimeters);
+
+    let layer = GerberLayer::new(commands);
+    if layer.try_bounding_box().is_none() {
+        return Err(parse_err.unwrap_or_else(|| "no geometry".into()));
+    }
+    let (color, visible) = style_for(name);
+    Ok(LoadedLayer { name: name.to_owned(), layer, unit, visible, color })
+}
+
+fn unit_label(unit: Unit) -> &'static str {
+    match unit {
+        Unit::Millimeters => "mm",
+        Unit::Inches => "in",
+    }
 }
 
 struct PcbApp {
@@ -62,9 +131,12 @@ struct PcbApp {
     bits: Vec<Bit>,
     selected_bit: usize,
     view_mode: ViewMode,
-    viewport: Viewport2D,
     log: Vec<String>,
-    layer: Option<gerber::GerberLayer>,
+    layers: Vec<LoadedLayer>,
+    view: ViewState,
+    ui_state: UiState,
+    transform: GerberTransform,
+    render_config: RenderConfiguration,
     fit_requested: bool,
 }
 
@@ -76,9 +148,12 @@ impl Default for PcbApp {
             bits: vec![Bit::new("V-bit 30°", 0.1), Bit::new("End mill 0.8", 0.8)],
             selected_bit: 0,
             view_mode: ViewMode::Gerber,
-            viewport: Viewport2D { offset: Vec2::ZERO, zoom: 4.0 },
             log: vec!["Ready. Drop a Gerber file on the window.".into()],
-            layer: None,
+            layers: Vec::new(),
+            view: ViewState::default(),
+            ui_state: UiState::default(),
+            transform: GerberTransform::default(),
+            render_config: RenderConfiguration::default(),
             fit_requested: false,
         }
     }
@@ -122,7 +197,7 @@ impl PcbApp {
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let path = self.path_text.trim().trim_matches('"').to_owned();
                     if !path.is_empty() {
-                        self.load_file(Path::new(&path));
+                        self.load_path(Path::new(&path));
                     }
                 }
 
@@ -148,6 +223,13 @@ impl PcbApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.view_mode, ViewMode::Gerber, "Gerber\nView");
                 ui.selectable_value(&mut self.view_mode, ViewMode::Toolpath, "Tool path\nview");
+                if ui
+                    .checkbox(&mut self.transform.mirroring.x, "Mirror X")
+                    .on_hover_text("Flip the layer, e.g. for bottom copper")
+                    .changed()
+                {
+                    self.fit_requested = true;
+                }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let generate_btn = egui::Button::new(egui::RichText::new("Generate").size(28.0).strong());
@@ -232,20 +314,37 @@ impl PcbApp {
 
                 ui.add_space(6.0);
 
-                // --- spare box (currently: log output)
+                // --- layers + log box
                 boxed(ui).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.set_min_height(ui.available_height() - 8.0);
-                    egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                        for line in &self.log {
-                            ui.label(line);
-                        }
-                    });
+                    ui.strong("Layers");
+                    egui::ScrollArea::vertical()
+                        .id_salt("layer_list")
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            for l in &mut self.layers {
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut l.visible, "");
+                                    ui.color_edit_button_srgba(&mut l.color);
+                                    ui.label(&l.name);
+                                });
+                            }
+                        });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("log")
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in &self.log {
+                                ui.label(line);
+                            }
+                        });
                 });
             });
     }
 
-    /// Centre: pannable / zoomable canvas showing the loaded Gerber layer
+    /// Centre: pannable / zoomable canvas, rendered by gerber_viewer
     fn canvas(&mut self, root: &mut egui::Ui) {
         egui::CentralPanel::default().show(root, |ui| {
             let (response, painter) =
@@ -255,156 +354,168 @@ impl PcbApp {
             // fit to view: after loading, on double-click, or with F
             let fit_key = response.hovered() && ui.input(|i| i.key_pressed(egui::Key::F));
             if self.fit_requested || response.double_clicked() || fit_key {
-                self.fit_view(rect);
+                // fit the union of all visible layers, *after* the transform so
+                // mirroring/rotation stay in view
+                let mut total: Option<BoundingBox> = None;
+                for l in self.layers.iter().filter(|l| l.visible) {
+                    if let Some(b) = l.layer.try_bounding_box() {
+                        let b = b.apply_transform(&self.transform);
+                        match &mut total {
+                            Some(t) => t.expand(&b),
+                            None => total = Some(b),
+                        }
+                    }
+                }
+                if let Some(b) = total {
+                    self.view.fit_view(rect, &b, 1.0);
+                }
                 self.fit_requested = false;
             }
 
-            // pan
-            if response.dragged() {
-                self.viewport.offset += response.drag_delta();
-            }
-            // zoom (scroll wheel / pinch), keeping the point under the cursor fixed
-            if response.hovered() {
-                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                let pinch = ui.input(|i| i.zoom_delta());
-                let factor = (scroll * 0.002).exp() * pinch;
-                if factor != 1.0 {
-                    let old = self.viewport.zoom;
-                    let new = (old * factor).clamp(0.01, 5000.0);
-                    if let Some(p) = response.hover_pos() {
-                        let c = rect.center() + self.viewport.offset;
-                        let world = (p - c) / old;
-                        self.viewport.offset = (p - world * new) - rect.center();
-                    }
-                    self.viewport.zoom = new;
-                }
-            }
-
-            let zoom = self.viewport.zoom;
-            let c = rect.center() + self.viewport.offset; // screen position of world origin
+            // pan / zoom / cursor tracking, all provided by gerber_viewer
+            self.ui_state.update(ui, &rect, &response, &mut self.view);
 
             // origin axes
+            let origin = self.ui_state.origin_screen_pos;
             let axis = Stroke::new(1.0, Color32::from_gray(90));
-            painter.line_segment([Pos2::new(rect.left(), c.y), Pos2::new(rect.right(), c.y)], axis);
-            painter.line_segment([Pos2::new(c.x, rect.top()), Pos2::new(c.x, rect.bottom())], axis);
+            painter.line_segment([Pos2::new(rect.left(), origin.y), Pos2::new(rect.right(), origin.y)], axis);
+            painter.line_segment([Pos2::new(origin.x, rect.top()), Pos2::new(origin.x, rect.bottom())], axis);
 
-            match &self.layer {
-                Some(layer) => {
-                    let bg = ui.visuals().panel_fill;
-                    let fg = match self.view_mode {
-                        ViewMode::Gerber => Color32::from_rgb(200, 150, 50),
+            let unit = self
+                .layers
+                .iter()
+                .find(|l| l.visible)
+                .map(|l| unit_label(l.unit))
+                .unwrap_or("mm");
+
+            if self.layers.is_empty() {
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Drop a Gerber file or .zip here\nor type its path above and press Enter",
+                    FontId::proportional(16.0),
+                    ui.visuals().weak_text_color(),
+                );
+            } else {
+                for l in self.layers.iter().filter(|l| l.visible) {
+                    let color = match self.view_mode {
+                        ViewMode::Gerber => l.color,
                         ViewMode::Toolpath => Color32::from_gray(70),
                     };
-                    // World mm (Y up) -> screen px (Y down). Clear-polarity vertices use the
-                    // background colour.
-                    let mut mesh = egui::Mesh::default();
-                    mesh.vertices.reserve(layer.verts.len());
-                    for v in &layer.verts {
-                        mesh.vertices.push(egui::epaint::Vertex {
-                            pos: Pos2::new(c.x + v.pos[0] * zoom, c.y - v.pos[1] * zoom),
-                            uv: egui::epaint::WHITE_UV,
-                            color: if v.clear { bg } else { fg },
-                        });
-                    }
-                    mesh.indices.extend_from_slice(&layer.indices);
-                    painter.add(egui::Shape::mesh(mesh));
-
-                    if self.view_mode == ViewMode::Toolpath {
-                        painter.text(
-                            rect.center_top() + Vec2::new(0.0, 12.0),
-                            Align2::CENTER_TOP,
-                            "Toolpath generation not implemented yet",
-                            FontId::proportional(14.0),
-                            ui.visuals().weak_text_color(),
-                        );
-                    }
+                    GerberRenderer::new(&self.render_config, self.view, &self.transform, &l.layer)
+                        .paint_layer(&painter, color);
                 }
-                None => {
+                if self.view_mode == ViewMode::Toolpath {
                     painter.text(
-                        rect.center(),
-                        Align2::CENTER_CENTER,
-                        "Drop a Gerber file here\nor type its path above and press Enter",
-                        FontId::proportional(16.0),
+                        rect.center_top() + Vec2::new(0.0, 12.0),
+                        Align2::CENTER_TOP,
+                        "Toolpath generation not implemented yet",
+                        FontId::proportional(14.0),
                         ui.visuals().weak_text_color(),
                     );
                 }
             }
 
-            // cursor position in mm
-            if let Some(p) = response.hover_pos() {
-                let (wx, wy) = ((p.x - c.x) / zoom, -(p.y - c.y) / zoom);
-                painter.text(
-                    rect.left_bottom() + Vec2::new(8.0, -8.0),
-                    Align2::LEFT_BOTTOM,
-                    format!("x {wx:8.3} mm   y {wy:8.3} mm   zoom {zoom:.1} px/mm"),
-                    FontId::monospace(12.0),
-                    ui.visuals().text_color(),
-                );
+            // cursor position in gerber units
+            if response.hovered() {
+                if let Some(p) = self.ui_state.cursor_gerber_coords {
+                    painter.text(
+                        rect.left_bottom() + Vec2::new(8.0, -8.0),
+                        Align2::LEFT_BOTTOM,
+                        format!("x {:9.3} {unit}   y {:9.3} {unit}", p.x, p.y),
+                        FontId::monospace(12.0),
+                        ui.visuals().text_color(),
+                    );
+                }
             }
         });
     }
 
-    fn fit_view(&mut self, rect: Rect) {
-        let Some((min, max)) = self.layer.as_ref().and_then(|l| l.bounds) else {
+    fn handle_dropped_files(&mut self, ui: &egui::Ui) {
+        let dropped = ui.input(|i| i.raw.dropped_files.clone());
+        for f in dropped {
+            let path = f.path();
+            if path.is_file() {
+                self.path_text = path.display().to_string();
+                self.load_path(path);
+            } else {
+                match f.bytes() {
+                    Ok(bytes) => self.load_single("dropped file", bytes),
+                    Err(e) => self.log.push(format!("Could not read dropped file: {e}")),
+                }
+            }
+        }
+    }
+
+    /// .zip -> all Gerber layers inside, anything else -> a single Gerber file
+    fn load_path(&mut self, path: &Path) {
+        let is_zip = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+        if is_zip {
+            self.load_zip(path);
+        } else {
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    self.load_single(&name, bytes);
+                }
+                Err(e) => self.log.push(format!("Cannot read {}: {e}", path.display())),
+            }
+        }
+    }
+
+    fn load_single(&mut self, name: &str, bytes: Vec<u8>) {
+        match parse_layer(name, bytes) {
+            Ok(layer) => {
+                self.log.push(format!("{name}: loaded"));
+                self.layers = vec![layer];
+                self.fit_requested = true;
+            }
+            Err(e) => self.log.push(format!("{name}: {e}")),
+        }
+    }
+
+    fn load_zip(&mut self, path: &Path) {
+        let Some(path_str) = path.to_str() else {
+            self.log.push("Zip path is not valid UTF-8".into());
             return;
         };
-        let w = (max[0] - min[0]).max(1e-3);
-        let h = (max[1] - min[1]).max(1e-3);
-        let zoom = (rect.width() / w).min(rect.height() / h) * 0.9;
-        let (cx, cy) = ((min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0);
-        self.viewport.zoom = zoom;
-        self.viewport.offset = Vec2::new(-cx * zoom, cy * zoom);
-    }
+        let files = match read_zip(path_str, ZIP_PATTERNS) {
+            Ok(files) => files,
+            Err(e) => {
+                self.log.push(format!("Cannot read zip: {e}"));
+                return;
+            }
+        };
 
-fn handle_dropped_files(&mut self, ui: &egui::Ui) {
-    let dropped = ui.input(|i| i.raw.dropped_files.clone());
-    for f in dropped {
-        let path = f.path();
-        if path.is_file() {
-            self.path_text = path.display().to_string();
-            self.load_file(path);
-        } else {
-            match f.bytes() {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    self.load_gerber_text("dropped file", &text);
-                }
-                Err(e) => self.log.push(format!("Could not read dropped file: {e}")),
+        // HashMap order is random; sort so the layer list is stable
+        let mut files: Vec<(String, Vec<u8>)> = files.into_iter().collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut layers = Vec::new();
+        for (entry_name, bytes) in files {
+            // drop any folder prefix inside the zip
+            let name = Path::new(&entry_name)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(entry_name);
+            if name.to_ascii_lowercase().ends_with(".gbrjob") {
+                continue; // KiCad job file: JSON, not a layer
+            }
+            match parse_layer(&name, bytes) {
+                Ok(layer) => layers.push(layer),
+                Err(e) => self.log.push(format!("{name}: skipped ({e})")),
             }
         }
-    }
-}
 
-    fn load_file(&mut self, path: &Path) {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                self.load_gerber_text(&name, &String::from_utf8_lossy(&bytes));
-            }
-            Err(e) => self.log.push(format!("Cannot read {}: {e}", path.display())),
+        if layers.is_empty() {
+            self.log.push("No Gerber layers found in zip".into());
+            return;
         }
-    }
-
-    fn load_gerber_text(&mut self, name: &str, text: &str) {
-        let layer = gerber::parse(text);
-        match layer.bounds {
-            Some((min, max)) => self.log.push(format!(
-                "{name}: {:.2} x {:.2} mm, {} draws, {} flashes, {} regions",
-                max[0] - min[0],
-                max[1] - min[1],
-                layer.n_draws,
-                layer.n_flashes,
-                layer.n_regions
-            )),
-            None => self.log.push(format!("{name}: no geometry found (is this a Gerber file?)")),
-        }
-        for w in layer.warnings.iter().take(5) {
-            self.log.push(format!("warning: {w}"));
-        }
-        self.layer = Some(layer);
+        self.log.push(format!("Loaded {} layers from zip", layers.len()));
+        self.layers = layers;
         self.fit_requested = true;
     }
 
