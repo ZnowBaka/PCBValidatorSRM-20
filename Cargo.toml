@@ -3,6 +3,10 @@ name = "validatorUX"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "pcb_validator"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0.105"
 eframe = "0.36.0"
