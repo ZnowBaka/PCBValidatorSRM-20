@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-1.1270 -1.1270 43.8340 55.5840" width="438" height="556">
+<rect x="-1.1270" y="-1.1270" width="43.8340" height="55.5840" fill="#ffffff"/>
+<mask id="m0" maskUnits="userSpaceOnUse" x="-1.1270" y="-1.1270" width="43.8340" height="55.5840">
+<rect x="-1.1270" y="-1.1270" width="43.8340" height="55.5840" fill="#000000"/>
+<polyline points="0.0000,53.3300 41.5800,53.3300 41.5800,0.0000 0.0000,0.0000 0.0000,53.3300 " fill="none" stroke="#ffffff" stroke-width="0.2540" stroke-linecap="round" stroke-linejoin="round"/>
+</mask>
+<rect x="-1.1270" y="-1.1270" width="43.8340" height="55.5840" fill="#b87333" mask="url(#m0)"/>
+<mask id="m1" maskUnits="userSpaceOnUse" x="-1.1270" y="-1.1270" width="43.8340" height="55.5840">
+<rect x="-1.1270" y="-1.1270" width="43.8340" height="55.5840" fill="#000000"/>
+<circle cx="7.6200" cy="8.8800" r="0.9398" fill="#ffffff"/>
+<circle cx="34.2900" cy="8.8800" r="0.9398" fill="#ffffff"/>
+</mask>
+<rect x="-1.1270" y="-1.1270" width="43.8340" height="55.5840" fill="#0066cc" mask="url(#m1)"/>
+</svg>

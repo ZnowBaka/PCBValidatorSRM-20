@@ -1,14 +1,10 @@
+use anyhow::Result;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use zip::ZipArchive;
-use anyhow::Result;
 
-
-pub fn read_zip(
-    zip_path: &str,
-    file_names: &[&str],
-) -> Result<HashMap<String, Vec<u8>>> {
+pub fn read_zip(zip_path: &str, file_names: &[&str]) -> Result<HashMap<String, Vec<u8>>> {
     let mut archive = ZipArchive::new(File::open(zip_path)?)?;
     let mut file_map = HashMap::new();
     for i in 0..archive.len() {

@@ -1,30 +1,18 @@
-use anyhow::anyhow;
-use std::io::{BufReader};
+mod parser;
+use anyhow::Error;
 
-mod zip_reader;
-use crate::zip_reader::read_zip;
+use crate::parser::gerber::{grb_parse, interpret};
 
-fn main() -> anyhow::Result<()> {
-    let file_names: Vec<&str> = vec![
-        "copper_top.gbr",
-        "soldermask_top.gbr",
-        "silkscreen_top.gbr",
-        "profile.gbr",
-    ];
+pub mod zip_reader;
+mod svg;
 
-    let _some_input = String::from("PCBForTesting_v1_Manufacturing_Output.zip");
-    let gerber_files = read_zip(&_some_input, &file_names)?;
-
-    for (name, bytes) in &gerber_files {
-        let reader = BufReader::new(bytes.as_slice());
-        let doc = gerber_parser::parse(reader)
-            .map_err(|(_partial_doc, e)| anyhow!("failed to parse: {name} : {:?}", e))?;
-        for cmd in doc.commands() {
-            println!("Commands: {:?}", cmd);
-        }
-        for err in doc.errors() {
-            println!("error: {:?}", err);
-        }
-    }
+fn main() -> Result<(), Error> {
+    let docs = grb_parse(r"C:\Users\user\Documents\rust\cam\PCBForTesing_v1_Manufacturing_Output.zip".to_string()).unwrap();
+    let outline = interpret(&docs[0]).map_err(Error::msg)?;
+    let copper  = interpret(&docs[2]).map_err(Error::msg)?;
+    svg::write_svg("debug.svg", &[
+        ("#b87333", copper.as_slice()),
+        ("#0066cc", outline.as_slice()),
+    ])?;
     Ok(())
 }
