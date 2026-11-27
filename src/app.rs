@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use eframe::egui;
+use egui_file_dialog::FileDialog;
 use gerber_viewer::{GerberTransform, RenderConfiguration, UiState, ViewState};
 
 use crate::board::layer::LoadedLayer;
@@ -26,6 +27,7 @@ pub struct PcbApp {
     pub(crate) transform: GerberTransform,
     pub(crate) render_config: RenderConfiguration,
     pub(crate) fit_requested: bool,
+    pub(crate) file_dialog: FileDialog,
 }
 
 impl Default for PcbApp {
@@ -43,6 +45,12 @@ impl Default for PcbApp {
             transform: GerberTransform::default(),
             render_config: RenderConfiguration::default(),
             fit_requested: false,
+            file_dialog: FileDialog::new().add_file_filter_extensions(
+                "Gerber and ZIP files",
+                vec![
+                    "gbr", "gtl", "gbl", "gts", "gbs", "gto", "gbo", "gm1", "gko", "gml", "zip",
+                ],
+            ),
         }
     }
 }
@@ -85,6 +93,10 @@ impl PcbApp {
         }
     }
 
+    pub(crate) fn open_file_browser(&mut self) {
+        self.file_dialog.pick_file();
+    }
+
     pub(crate) fn generate(&mut self) {
         let bit = &self.bits[self.selected_bit];
         self.log.push(format!(
@@ -100,5 +112,11 @@ impl eframe::App for PcbApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ui);
         crate::ui::show(self, ui);
+
+        self.file_dialog.update(ui.ctx());
+        if let Some(path) = self.file_dialog.take_picked() {
+            self.path_text = path.display().to_string();
+            self.load_path(&path);
+        }
     }
 }

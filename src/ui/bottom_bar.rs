@@ -7,7 +7,8 @@ pub(super) fn show(app: &mut PcbApp, root: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.selectable_value(&mut app.view_mode, ViewMode::Gerber, "Gerber\nView");
-            ui.selectable_value(&mut app.view_mode, ViewMode::Toolpath, "Tool path\nview");
+            
+            ui.selectable_value(&mut app.view_mode, ViewMode::Toolpath, "Tool path\nView");
             if ui
                 .checkbox(&mut app.transform.mirroring.x, "Mirror X")
                 .on_hover_text("Flip the layer, e.g. for bottom copper")
